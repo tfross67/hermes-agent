@@ -1307,6 +1307,51 @@ def _seed_live_delivery_sessions(t: _TargetDelivery, delivered_message_id) -> No
         enabled=t.mirror_this_target and not thread_seeded and not inchannel_seeded)
 
 
+def _deliver_via_session_transcript(
+    t: _TargetDelivery, cleaned_text: str, media_files: list, *,
+    target_errors: list, delivery_errors: list,
+) -> bool:
+    """Stateless-adapter lane (api_server): ``send()`` is a deliberate stub on request/response
+    surfaces, so the live-send and standalone lanes can never deliver there. Persist the
+    delivery into the origin session's transcript instead — desktop/TUI clients poll
+    ``GET /api/sessions/{id}/messages`` and see the row with no agent turn and no spend (the
+    #85957 mechanism, ``gateway.wake.persist_delegation_delivery``). For api_server targets the
+    chat_id IS the raw session id, so no origin scan is needed. Role stays ``user`` with the
+    cron label prefix for strict alternation (#2221). Media has no transcript lane — the drop
+    is recorded in ``delivery_errors``, not silently lost.
+
+    Writes go through ``append_message`` directly, NOT ``mirror_to_session``: the mirror is
+    best-effort and swallows write failures (a dropped mirror must not fail a real send), but
+    here the persist IS the delivery — a failed write must surface as a failed delivery."""
+    job = t.job
+    text = cleaned_text.strip()
+    if not text:
+        _note_target_error(
+            job, f"stateless transcript delivery skipped (empty text) for {t.where}", target_errors)
+        return False
+    from hermes_state_registry import acquire, release_or_close
+    db = acquire()
+    try:
+        db.append_message(
+            session_id=str(t.chat_id), role="user", content=_cron_mirror_message(job, text))
+    except Exception as exc:
+        _note_target_error(job, f"stateless transcript delivery to {t.where} failed: {exc}",
+                           target_errors)
+        return False
+    finally:
+        release_or_close(db)
+    if media_files:
+        _note_target_error(
+            job,
+            f"{len(media_files)} media attachment(s) not delivered to "
+            f"{t.where} (stateless transcript lane is text-only)",
+            delivery_errors)
+    logger.info(
+        "Job '%s': delivered to %s via session transcript (stateless adapter, no agent turn)",
+        job["id"], t.where)
+    return True
+
+
 def _deliver_via_live_adapter(
     t: _TargetDelivery, cleaned_text: str, media_files: list, *, target_errors: list,
     delivery_errors: list, unverified_targets: list,
@@ -1315,6 +1360,12 @@ def _deliver_via_live_adapter(
     this lane's soft failures (surfaced only if standalone also fails); ``delivery_errors`` =
     partial failures (media, thread fallback) that surface even on success."""
     job = t.job
+    # Stateless surfaces (api_server): adapter.send() is a stub by design — persist into the
+    # session transcript instead of attempting a send that can never succeed.
+    if t.runtime_adapter is not None and not getattr(t.runtime_adapter, "supports_async_delivery", True):
+        return _deliver_via_session_transcript(
+            t, cleaned_text, media_files,
+            target_errors=target_errors, delivery_errors=delivery_errors)
     route_thread_id, route_metadata, media_metadata = _live_route_metadata(t)
     delivered = False
     try:
